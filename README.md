@@ -1,4 +1,4 @@
-# 📊 Cleemy Analyzer
+# 📊 Full Json Notes de Frais - Lucca
 
 **Cleemy Analyzer** est une application **Streamlit** permettant d'analyser visuellement, auditer et exporter les associations Profils / Natures, les règles de dépenses, et les plans comptables issus d’une extraction JSON Cleemy (Lucca).
 
