@@ -101,10 +101,6 @@ Ce projet est sous licence **MIT** (modifiable selon ton contexte).
 
 Pour toute question, suggestion ou demande d'amélioration :
 
-**Simon Grossi**  
-📧 [simon.grossi@gmail.com](mailto:simon.grossi@gmail.com)  
-🔗 [github.com/simongrossi](https://github.com/simongrossi)
-
 ---
 
 > Application développée pour l’audit et la cartographie rapide des politiques de dépenses Notes de Frais Cleemy / Lucca, notamment dans des contextes multi-profils et multi-plans comptables.
