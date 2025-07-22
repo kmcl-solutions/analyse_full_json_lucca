@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import json
 from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 import io
 import traceback
 
@@ -141,36 +142,45 @@ def _create_nature_to_profiles_map(data: dict) -> dict:
                 profile_rules["allowances"].append(allowance)
     return nature_map
 
-# --- GÉNÉRATION DU RAPPORT PDF ---
 def create_pdf_report(df: pd.DataFrame) -> bytes:
     """
-    Génère un rapport PDF en utilisant uniquement des polices standards (Arial).
-    Les caractères non-compatibles (non-latin1) sont remplacés pour éviter toute erreur.
+    Génère un rapport PDF avec la syntaxe moderne de fpdf2, sans avertissements.
     """
     pdf = FPDF()
     pdf.add_page()
 
-    pdf.set_font("Arial", 'B', size=12)
-    pdf.cell(0, 10, "Rapport d'analyse Cleemy", ln=True, align='C')
+    # Utilise la police standard "Helvetica"
+    pdf.set_font("Helvetica", 'B', size=12)
+    
+    # Utilise la nouvelle syntaxe pour le saut de ligne
+    pdf.cell(
+        0, 10, "Rapport d'analyse Cleemy",
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+        align='C'
+    )
     pdf.ln(10)
 
+    # Préparation du tableau
     num_columns = len(df.columns) if len(df.columns) > 0 else 1
     col_width = 190 / num_columns
 
-    pdf.set_font("Arial", 'B', size=8)
+    # En-tête du tableau
+    pdf.set_font("Helvetica", 'B', size=8)
     for header in df.columns:
         safe_header = str(header).encode('latin-1', 'replace').decode('latin-1')
         pdf.cell(col_width, 10, safe_header, border=1, align='C')
     pdf.ln()
 
-    pdf.set_font("Arial", '', size=8)
+    # Corps du tableau
+    pdf.set_font("Helvetica", '', size=8)
     for _, row in df.iterrows():
         for col in df.columns:
             safe_text = str(row[col]).encode('latin-1', 'replace').decode('latin-1')
             pdf.cell(col_width, 10, safe_text, border=1)
         pdf.ln()
             
-    return bytes(pdf.output(dest='S'))
+    # Nouvelle syntaxe pour la sortie en bytes, sans le paramètre "dest"
+    return bytes(pdf.output())
 
 # --- INTERFACES DES ONGLETS ---
 def build_overview_ui(df_profiles: pd.DataFrame):
