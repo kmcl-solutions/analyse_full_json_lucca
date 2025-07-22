@@ -2,36 +2,76 @@
 import streamlit as st
 import pandas as pd
 import json
-from fpdf import FPDF # pip install fpdf2
-from collections import defaultdict
+from fpdf import FPDF
+import io
+import traceback
 
-# --- Configuration de la page Streamlit ---
+# --- CONFIGURATION & CONSTANTES ---
 st.set_page_config(page_title="Rapports Cleemy", layout="wide")
 
-# --- Fonctions utilitaires ---
-def safe_latin1(val) -> str:
-    """Encode une valeur pour éviter les erreurs d'encodage dans FPDF."""
-    return str(val).encode('latin-1', 'replace').decode('latin-1')
+PERIOD_TRANSLATION = {"Day": "par Jour", "None": "par Dépense", "Month": "par Mois", "Year": "par An"}
 
-# --- Fonctions de traitement des données ---
+# --- FONCTIONS DE TRAITEMENT DES DONNÉES (VERSION FINALE ET ROBUSTE) ---
 
-@st.cache_data(hash_funcs={"_io.BytesIO": lambda _: None})
-def load_data(uploaded_file) -> dict:
-    """Charge le contenu du fichier JSON uploadé et le met en cache."""
-    return json.load(uploaded_file)
+def safe_get(data, key, default):
+    """Fonction utilitaire pour obtenir une valeur ou un défaut sûr (liste/dict)."""
+    val = data.get(key, default)
+    # Gère le cas où la clé existe mais sa valeur est None
+    if val is None:
+        return default
+    return val
 
 @st.cache_data
-def process_profile_data(data: dict) -> pd.DataFrame:
-    """Crée un DataFrame plat pour la vue d'ensemble Profils/Natures."""
-    nature_lookup = {
-        n['id']: n.get('multilingualName', {}).get('fr-FR', f"ID {n['id']}")
-        for n in data.get('natures', [])
-    }
-    
+def load_and_process_data(uploaded_file: io.BytesIO) -> dict | None:
+    """
+    Charge, valide et pré-traite les données JSON de manière très robuste.
+    """
+    try:
+        # Rembobine le fichier au cas où il a déjà été lu
+        uploaded_file.seek(0)
+        data = json.load(uploaded_file)
+
+        if not isinstance(data, dict) or "profiles" not in data or "natures" not in data:
+            st.error("❌ Fichier invalide : la structure de base (clés `profiles`, `natures`) est incorrecte.")
+            return {"error": "Structure de base invalide", "raw_data": data}
+
+        nature_lookup = {
+            n.get('id'): n.get('multilingualName', {}).get('fr-FR', f"ID {n.get('id')}")
+            for n in safe_get(data, 'natures', []) if isinstance(n, dict) and n.get('id') is not None
+        }
+
+        df_profiles = _create_profile_nature_df(data, nature_lookup)
+        df_limits = _create_limits_df(data, nature_lookup)
+        nature_to_profiles_map = _create_nature_to_profiles_map(data)
+
+        return {
+            "raw_data": data,
+            "nature_lookup": nature_lookup,
+            "df_profiles": df_profiles,
+            "df_limits": df_limits,
+            "nature_to_profiles_map": nature_to_profiles_map,
+            "error": None
+        }
+    except json.JSONDecodeError:
+        st.error("❌ Le fichier fourni n'est pas un JSON valide.")
+        return {"error": "JSONDecodeError"}
+    except Exception as e:
+        st.error(f"Une erreur critique est survenue lors du traitement : {e}")
+        tb_str = traceback.format_exc()
+        try:
+            uploaded_file.seek(0)
+            raw_display_data = uploaded_file.read().decode('utf-8')
+        except:
+            raw_display_data = "Impossible de lire le contenu du fichier pour le débogage."
+        return {"error": tb_str, "raw_data": raw_display_data}
+
+def _create_profile_nature_df(data: dict, nature_lookup: dict) -> pd.DataFrame:
+    """Crée le DataFrame des associations Profils/Natures de manière sécurisée."""
     export_data = []
-    for profile in data.get("profiles", []):
-        profil_name = profile.get('multilingualName', {}).get('fr-FR', f"ID {profile.get('id', 'N/A')}")
-        for id_nature in profile.get("idNatures", []):
+    for profile in safe_get(data, 'profiles', []):
+        if not isinstance(profile, dict): continue
+        profil_name = safe_get(profile, 'multilingualName', {}).get('fr-FR', f"ID {profile.get('id', 'N/A')}")
+        for id_nature in safe_get(profile, 'idNatures', []):
             export_data.append({
                 "Profil": profil_name,
                 "ID Nature": id_nature,
@@ -39,80 +79,107 @@ def process_profile_data(data: dict) -> pd.DataFrame:
             })
     return pd.DataFrame(export_data)
 
-@st.cache_data
-def process_limits_data(data: dict) -> pd.DataFrame:
-    """Crée un DataFrame de toutes les limites et indemnités pour une analyse centralisée."""
-    nature_lookup = {
-        n['id']: n.get('multilingualName', {}).get('fr-FR', f"ID {n['id']}")
-        for n in data.get('natures', [])
-    }
-    period_translation = {"Day": "par Jour", "None": "par Dépense", "Month": "par Mois", "Year": "par An"}
-    
+def _create_limits_df(data: dict, nature_lookup: dict) -> pd.DataFrame:
+    """Crée un DataFrame unifié des limites et indemnités de manière sécurisée."""
     limits_data = []
-    for profile in data.get("profiles", []):
-        profile_name = profile.get('multilingualName', {}).get('fr-FR', f"ID {profile.get('id', 'N/A')}")
-        
-        for limit in profile.get('limits', []):
-            nature_names = [nature_lookup.get(nid) for nid in limit.get('idNatures', [])]
+    for profile in safe_get(data, 'profiles', []):
+        if not isinstance(profile, dict): continue
+        profile_name = safe_get(profile, 'multilingualName', {}).get('fr-FR', f"ID {profile.get('id', 'N/A')}")
+
+        for limit in safe_get(profile, 'limits', []):
+            if not isinstance(limit, dict): continue
+            nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in safe_get(limit, 'idNatures', [])]
+            thresholds = safe_get(limit, 'thresholds', [{}])[0]
             limits_data.append({
-                "Profil": profile_name,
-                "Type de Règle": "Limite",
+                "Profil": profile_name, "Type de Règle": "Limite",
                 "Natures Concernées": ", ".join(filter(None, nature_names)),
                 "Type de Plafond": limit.get('type', 'N/A').capitalize(),
-                "Montant": limit.get('thresholds', [{}])[0].get('amount', 'N/A'),
+                "Montant": thresholds.get('amount', 'N/A'),
                 "Devise": limit.get('currencyCode', ''),
-                "Période": period_translation.get(limit.get('period', 'N/A'), limit.get('period', 'N/A'))
+                "Période": PERIOD_TRANSLATION.get(limit.get('period', 'N/A'), limit.get('period', 'N/A'))
             })
-            
-        for allowance in profile.get('allowances', []):
-            nature_names = [nature_lookup.get(nid) for nid in allowance.get('idNatures', [])]
+
+        for allowance in safe_get(profile, 'allowances', []):
+            if not isinstance(allowance, dict): continue
+            nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in safe_get(allowance, 'idNatures', [])]
+            thresholds = safe_get(allowance, 'thresholds', [{}])[0]
             limits_data.append({
-                "Profil": profile_name,
-                "Type de Règle": "Indemnité",
+                "Profil": profile_name, "Type de Règle": "Indemnité",
                 "Natures Concernées": ", ".join(filter(None, nature_names)),
                 "Type de Plafond": "Forfait",
-                "Montant": allowance.get('thresholds', [{}])[0].get('amount', 'N/A'),
-                "Devise": allowance.get('currencyCode', ''),
-                "Période": "N/A"
+                "Montant": thresholds.get('amount', 'N/A'),
+                "Devise": allowance.get('currencyCode', ''), "Période": "N/A"
             })
-            
     return pd.DataFrame(limits_data)
 
-# --- Génération du rapport PDF ---
+def _create_nature_to_profiles_map(data: dict) -> dict:
+    """
+    Crée un dictionnaire inversé. Version compatible avec le cache de Streamlit.
+    """
+    nature_map = {}
+    profiles_list = safe_get(data, 'profiles', [])
+    if not isinstance(profiles_list, list):
+        profiles_list = []
+
+    for profile in profiles_list:
+        if not isinstance(profile, dict): continue
+        profile_name = safe_get(profile, 'multilingualName', {}).get('fr-FR', f"ID {profile.get('id', 'N/A')}")
+
+        for nature_id in safe_get(profile, 'idNatures', []):
+            nature_map.setdefault(nature_id, {}).setdefault(profile_name, {"limits": [], "allowances": []})
+
+        for limit in safe_get(profile, 'limits', []):
+            if not isinstance(limit, dict): continue
+            for nature_id in safe_get(limit, 'idNatures', []):
+                profile_rules = nature_map.setdefault(nature_id, {}).setdefault(profile_name, {"limits": [], "allowances": []})
+                profile_rules["limits"].append(limit)
+
+        for allowance in safe_get(profile, 'allowances', []):
+            if not isinstance(allowance, dict): continue
+            for nature_id in safe_get(allowance, 'idNatures', []):
+                profile_rules = nature_map.setdefault(nature_id, {}).setdefault(profile_name, {"limits": [], "allowances": []})
+                profile_rules["allowances"].append(allowance)
+    return nature_map
+
+# --- GÉNÉRATION DU RAPPORT PDF ---
 def create_pdf_report(df: pd.DataFrame) -> bytes:
+    """
+    Génère un rapport PDF en utilisant uniquement des polices standards (Arial).
+    Les caractères non-compatibles (non-latin1) sont remplacés pour éviter toute erreur.
+    """
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Arial", size=12)
+
+    pdf.set_font("Arial", 'B', size=12)
     pdf.cell(0, 10, "Rapport d'analyse Cleemy", ln=True, align='C')
     pdf.ln(10)
+
+    num_columns = len(df.columns) if len(df.columns) > 0 else 1
+    col_width = 190 / num_columns
+
     pdf.set_font("Arial", 'B', size=8)
-
-    max_lengths = {col: df[col].astype(str).str.len().max() for col in df.columns}
-    header_lengths = {col: len(col) for col in df.columns}
-    final_lengths = {col: max(max_lengths.get(col, 0), header_lengths.get(col, 0)) for col in df.columns}
-    total_len = sum(final_lengths.values()) if sum(final_lengths.values()) > 0 else 1
-    col_widths = [(final_lengths[col] / total_len) * 190 for col in df.columns]
-
-    for i, header in enumerate(df.columns):
-        pdf.cell(float(col_widths[i]), 10, safe_latin1(header), border=1, align='C')
+    for header in df.columns:
+        safe_header = str(header).encode('latin-1', 'replace').decode('latin-1')
+        pdf.cell(col_width, 10, safe_header, border=1, align='C')
     pdf.ln()
-    pdf.set_font("Arial", size=8)
 
+    pdf.set_font("Arial", '', size=8)
     for _, row in df.iterrows():
-        for i, col in enumerate(df.columns):
-            pdf.cell(float(col_widths[i]), 10, safe_latin1(row[col]), border=1)
+        for col in df.columns:
+            safe_text = str(row[col]).encode('latin-1', 'replace').decode('latin-1')
+            pdf.cell(col_width, 10, safe_text, border=1)
         pdf.ln()
-        
-    return bytes(pdf.output())
+            
+    return bytes(pdf.output(dest='S'))
 
 # --- INTERFACES DES ONGLETS ---
-
 def build_overview_ui(df_profiles: pd.DataFrame):
     st.header("📖 Vue d'ensemble des associations Profils/Natures")
     st.write("Utilisez ce tableau pour une vue globale, filtrer ou exporter les données.")
-    
+
     profils_uniques = sorted(df_profiles["Profil"].unique().tolist())
-    selected_profil = st.selectbox("🔍 Filtrer par profil", options=["Tous"] + profils_uniques)
+    options = ["Tous"] + profils_uniques
+    selected_profil = st.selectbox("🔍 Filtrer par profil", options=options, key="overview_select")
 
     display_df = df_profiles if selected_profil == "Tous" else df_profiles[df_profiles["Profil"] == selected_profil]
 
@@ -120,216 +187,204 @@ def build_overview_ui(df_profiles: pd.DataFrame):
         st.warning("Aucun résultat pour ce filtre.")
     else:
         st.dataframe(display_df, use_container_width=True)
+        st.divider()
+        st.subheader("🚀 Exports")
+        col1, col2 = st.columns(2)
+        with col1:
+            csv_data = display_df.to_csv(index=False).encode('utf-8')
+            st.download_button(label="📥 Télécharger en CSV", data=csv_data, file_name='rapport_profils.csv', mime='text/csv', use_container_width=True)
+        with col2:
+            pdf_bytes = create_pdf_report(display_df)
+            st.download_button(label="📄 Télécharger en PDF", data=pdf_bytes, file_name="rapport_profils.pdf", mime="application/pdf", use_container_width=True)
 
-    st.divider()
-    st.subheader("🚀 Exports")
-    col1, col2 = st.columns(2)
-    with col1:
-        csv_data = display_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Télécharger la vue en CSV",
-            data=csv_data,
-            file_name=f'rapport_profils_natures_{selected_profil.replace(" ", "_")}.csv',
-            mime='text/csv',
-            use_container_width=True
-        )
-    with col2:
-        pdf_bytes = create_pdf_report(display_df)
-        st.download_button(
-            label="📄 Télécharger la vue en PDF",
-            data=pdf_bytes,
-            file_name=f"rapport_profils_natures_{selected_profil.replace(' ', '_')}.pdf",
-            mime="application/pdf",
-            use_container_width=True
-        )
-
-def build_profile_analysis_ui(data: dict):
+def build_profile_analysis_ui(data: dict, nature_lookup: dict):
     st.header("👤 Analyse détaillée par Profil")
     st.write("Choisissez un profil pour afficher en détail sa configuration complète.")
 
-    nature_lookup = {n['id']: n.get('multilingualName', {}).get('fr-FR', f"ID {n['id']}") for n in data.get('natures', [])}
-    profiles = {p.get('multilingualName', {}).get('fr-FR', f"ID {p.get('id', 'N/A')}"): p for p in data.get('profiles', [])}
-    
-    selected_profil_name = st.selectbox("Sélectionnez un profil", options=sorted(profiles.keys()))
+    profiles = {p.get('multilingualName', {}).get('fr-FR', f"ID {p.get('id', 'N/A')}"): p for p in safe_get(data, 'profiles', []) if isinstance(p, dict)}
+    sorted_profiles = sorted(profiles.keys())
+    selected_profil_name = st.selectbox("Sélectionnez un profil", options=sorted_profiles, key="profile_select")
 
-    if selected_profil_name:
-        profile = profiles[selected_profil_name]
-        st.divider()
-        st.subheader(f"Détails pour : {selected_profil_name}")
+    if not selected_profil_name: return
 
-        st.markdown("##### Natures associées")
-        id_natures = profile.get('idNatures', [])
-        nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in id_natures]
-        st.dataframe({"Natures": sorted(nature_names)}, use_container_width=True)
+    profile = profiles[selected_profil_name]
+    st.divider()
+    st.subheader(f"Détails pour : {selected_profil_name}")
 
-        period_translation = {"Day": "par Jour", "None": "par Dépense", "Month": "par Mois", "Year": "par An"}
-        
-        # --- DÉBUT DE LA CORRECTION ---
-        # On construit une liste de messages texte au lieu de plusieurs widgets st.error/warning
-        st.markdown("##### Limites de Dépenses (Plafonds)")
-        limits = profile.get('limits', [])
-        if not limits:
-            st.info("Aucune limite spécifique n'est définie.")
-        else:
-            limit_messages = []
-            for limit in limits:
-                amount, currency = limit.get('thresholds', [{}])[0].get('amount', 'N/A'), limit.get('currencyCode', '')
-                limit_type, period = limit.get('type', 'N/A').capitalize(), limit.get('period', 'N/A')
-                nature_names_limit = [nature_lookup.get(nid) for nid in limit.get('idNatures', [])]
-                
-                prefix = "🛑" if limit_type == "Absolute" else "⚠️"
-                message = f"{prefix} **{limit_type}** → **{amount} {currency}** {period_translation.get(period, period)} pour : **{', '.join(filter(None, nature_names_limit))}**"
-                limit_messages.append(message)
-            st.markdown("\n\n".join(limit_messages))
+    st.markdown("##### Natures associées")
+    id_natures = safe_get(profile, 'idNatures', [])
+    nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in id_natures]
+    st.dataframe({"Natures": sorted(nature_names)}, use_container_width=True)
 
-        st.markdown("##### Indemnités Forfaitaires (Allowances)")
-        allowances = profile.get('allowances', [])
-        if not allowances:
-            st.info("Aucune indemnité forfaitaire n'est définie.")
-        else:
-            allowance_messages = []
-            for allowance in allowances:
-                amount, currency = allowance.get('thresholds', [{}])[0].get('amount', 'N/A'), allowance.get('currencyCode', '')
-                nature_names_allowance = [nature_lookup.get(nid) for nid in allowance.get('idNatures', [])]
-                message = f"✅ **Forfait** → **{amount} {currency}** pour : **{', '.join(filter(None, nature_names_allowance))}**"
-                allowance_messages.append(message)
-            st.markdown("\n\n".join(allowance_messages))
-        # --- FIN DE LA CORRECTION ---
+    st.markdown("##### Limites de Dépenses (Plafonds)")
+    limits = safe_get(profile, 'limits', [])
+    if not limits:
+        st.info("Aucune limite spécifique n'est définie.")
+    else:
+        limit_messages = []
+        for limit in limits:
+            thresholds = safe_get(limit, 'thresholds', [{}])[0]
+            amount, currency = thresholds.get('amount', 'N/A'), limit.get('currencyCode', '')
+            limit_type, period = limit.get('type', 'N/A').capitalize(), limit.get('period', 'N/A')
+            nature_names_limit = [nature_lookup.get(nid, f"ID {nid}") for nid in safe_get(limit, 'idNatures', [])]
+            prefix = "🛑" if limit_type == "Absolute" else "⚠️"
+            message = f"{prefix} **{limit_type}** → **{amount} {currency}** {PERIOD_TRANSLATION.get(period, period)} pour : **{', '.join(filter(None, nature_names_limit))}**"
+            limit_messages.append(message)
+        st.markdown("\n\n".join(limit_messages))
 
-def build_limits_analysis_ui(data: dict):
+    st.markdown("##### Indemnités Forfaitaires (Allowances)")
+    allowances = safe_get(profile, 'allowances', [])
+    if not allowances:
+        st.info("Aucune indemnité forfaitaire n'est définie.")
+    else:
+        allowance_messages = []
+        for allowance in allowances:
+            thresholds = safe_get(allowance, 'thresholds', [{}])[0]
+            amount, currency = thresholds.get('amount', 'N/A'), allowance.get('currencyCode', '')
+            nature_names_allowance = [nature_lookup.get(nid, f"ID {nid}") for nid in safe_get(allowance, 'idNatures', [])]
+            message = f"✅ **Forfait** → **{amount} {currency}** pour : **{', '.join(filter(None, nature_names_allowance))}**"
+            allowance_messages.append(message)
+        st.markdown("\n\n".join(allowance_messages))
+
+def build_limits_analysis_ui(df_limits: pd.DataFrame):
     st.header("📏 Analyse comparative des Limites et Indemnités")
     st.write("Ce tableau centralise toutes les règles de tous les profils pour faciliter leur comparaison.")
-    
-    df_limits = process_limits_data(data)
     if df_limits.empty:
         st.warning("Aucune limite ou indemnité n'a été trouvée dans le fichier.")
-        return
-        
-    st.dataframe(df_limits, use_container_width=True)
-    
+    else:
+        st.dataframe(df_limits, use_container_width=True)
+
 def build_accounting_plan_ui(data: dict):
     st.header("🧾 Analyse du Plan Comptable par Nature")
     st.write("Choisissez une nature pour voir son imputation comptable dans chaque plan.")
 
-    natures_list = sorted([(n.get('multilingualName', {}).get('fr-FR', f"ID {n['id']}"), n['id']) for n in data.get('natures', [])])
-    costs_accounts_lookup = {
-        chart['id']: {
-            acc['id']: (acc.get('format')[0].get('value', 'N/A') if acc.get('format') else 'N/A')
-            for acc in chart.get('costsAccounts', [])
-        } for chart in data.get('chartsOfAccounts', [])
-    }
+    # --- Boucle corrigée pour être robuste ---
+    costs_accounts_lookup = {}
+    for chart in safe_get(data, 'chartsOfAccounts', []):
+        if not isinstance(chart, dict): continue
+        chart_id = chart.get('id')
+        if chart_id is None: continue
+
+        accounts_dict = {}
+        for acc in safe_get(chart, 'costsAccounts', []):
+            if not isinstance(acc, dict): continue
+            acc_id = acc.get('id')
+            if acc_id is None: continue
+            
+            format_list = safe_get(acc, 'format', [])
+            value = format_list[0].get('value', 'N/A') if format_list else 'N/A'
+            accounts_dict[acc_id] = value
+            
+        costs_accounts_lookup[chart_id] = accounts_dict
+
+    natures_list = sorted([(n.get('multilingualName', {}).get('fr-FR', f"ID {n['id']}"), n['id']) for n in safe_get(data, 'natures', []) if isinstance(n, dict)])
     
-    selected_nature_name = st.selectbox("Choisissez une nature à analyser", options=[n[0] for n in natures_list])
+    selected_nature_name = st.selectbox("Choisissez une nature à analyser", options=[n[0] for n in natures_list], key="accounting_select")
     st.divider()
 
     if selected_nature_name:
-        selected_nature_id = next(n[1] for n in natures_list if n[0] == selected_nature_name)
+        selected_nature_id = next((n[1] for n in natures_list if n[0] == selected_nature_name), None)
         found = False
-        for chart in data.get('chartsOfAccounts', []):
-            for mapping in chart.get('natureAccountMappings', []):
-                if mapping.get('idNature') == selected_nature_id:
-                    found = True
-                    with st.expander(f"**{chart.get('name')}**", expanded=True):
-                        id_costs_account = mapping.get('idCostsAccount')
-                        compte_de_charge = costs_accounts_lookup.get(chart['id'], {}).get(id_costs_account, 'Non trouvé')
-                        tva_ids = mapping.get('vatOptions', {}).get('idCountryVats', [])
-                        
-                        st.markdown(f"**Compte de charge :** `{compte_de_charge}`")
-                        st.markdown(f"**ID de TVA applicables :** `{', '.join(map(str, tva_ids)) or 'Aucun'}`")
+        if selected_nature_id is not None:
+            for chart in safe_get(data, 'chartsOfAccounts', []):
+                if not isinstance(chart, dict): continue
+                for mapping in safe_get(chart, 'natureAccountMappings', []):
+                    if not isinstance(mapping, dict): continue
+                    if mapping.get('idNature') == selected_nature_id:
+                        found = True
+                        with st.expander(f"**{chart.get('name')}**", expanded=True):
+                            id_costs_account = mapping.get('idCostsAccount')
+                            compte_de_charge = costs_accounts_lookup.get(chart.get('id'), {}).get(id_costs_account, 'Non trouvé')
+                            tva_ids = safe_get(mapping, 'vatOptions', {}).get('idCountryVats', [])
+                            st.markdown(f"**Compte de charge :** `{compte_de_charge}`")
+                            st.markdown(f"**ID de TVA applicables :** `{', '.join(map(str, tva_ids)) or 'Aucun'}`")
         if not found:
             st.warning(f"La nature **{selected_nature_name}** n'est associée à aucun plan comptable.")
 
-def build_nature_analysis_ui(data: dict):
+def build_nature_analysis_ui(nature_lookup: dict, nature_to_profiles_map: dict):
     st.header("🔬 Analyse détaillée par Nature")
     st.write("Choisissez une nature pour voir tous les profils et les règles qui s'y appliquent.")
 
-    nature_lookup = {n['id']: n.get('multilingualName', {}).get('fr-FR', f"ID {n['id']}") for n in data.get('natures', [])}
     natures_list = sorted(nature_lookup.items(), key=lambda item: item[1])
-
-    selected_nature_id = st.selectbox("Sélectionnez une nature", options=[n[0] for n in natures_list], format_func=lambda x: nature_lookup.get(x, "N/A"))
+    selected_nature_id = st.selectbox(
+        "Sélectionnez une nature",
+        options=[n[0] for n in natures_list],
+        format_func=lambda x: nature_lookup.get(x, "N/A"),
+        key="nature_select"
+    )
     st.divider()
 
-    if selected_nature_id:
-        st.subheader(f"Profils et règles pour : {nature_lookup[selected_nature_id]}")
-        profiles_with_nature = defaultdict(lambda: {"limits": [], "allowances": []})
+    if not selected_nature_id: return
 
-        for profile in data.get("profiles", []):
-            if selected_nature_id in profile.get("idNatures", []):
-                profile_name = profile.get('multilingualName', {}).get('fr-FR', f"ID {profile.get('id', 'N/A')}")
-                for limit in profile.get('limits', []):
-                    if selected_nature_id in limit.get('idNatures', []):
-                        profiles_with_nature[profile_name]["limits"].append(limit)
-                for allowance in profile.get('allowances', []):
-                    if selected_nature_id in allowance.get('idNatures', []):
-                        profiles_with_nature[profile_name]["allowances"].append(allowance)
-        
-        if not profiles_with_nature:
-            st.warning("Aucun profil n'utilise cette nature ou n'a de règle spécifique pour elle.")
-            return
+    profiles_for_nature = nature_to_profiles_map.get(selected_nature_id, {})
+    if not profiles_for_nature:
+        st.warning("Aucun profil n'utilise cette nature.")
+        return
 
-        period_translation = {"Day": "par Jour", "None": "par Dépense", "Month": "par Mois", "Year": "par An"}
-        
-        for profile_name, rules in sorted(profiles_with_nature.items()):
-            st.subheader(f"Profil : {profile_name}")
-            
+    st.subheader(f"Profils et règles pour : {nature_lookup[selected_nature_id]}")
+    for profile_name, rules in sorted(profiles_for_nature.items()):
+        with st.container():
+            st.markdown(f"#### Profil : {profile_name}")
+
             if not rules["limits"] and not rules["allowances"]:
                 st.info("Ce profil utilise cette nature sans limite ni indemnité spécifique.")
-            
+
             if rules["limits"]:
                 st.markdown("###### Limites (Plafonds)")
                 for limit in rules["limits"]:
-                    amount, currency = limit.get('thresholds', [{}])[0].get('amount', 'N/A'), limit.get('currencyCode', '')
+                    thresholds = safe_get(limit, 'thresholds', [{}])[0]
+                    amount, currency = thresholds.get('amount', 'N/A'), limit.get('currencyCode', '')
                     limit_type, period = limit.get('type', 'N/A').capitalize(), limit.get('period', 'N/A')
-                    message = f"**{limit_type}** → **{amount} {currency}** {period_translation.get(period, period)}"
-                    st.error(message) if limit_type == "Absolute" else st.warning(message)
+                    message = f"**{limit_type}** → **{amount} {currency}** {PERIOD_TRANSLATION.get(period, period)}"
+                    if limit_type == "Absolute":
+                        st.error(f"🛑 {message}")
+                    else:
+                        st.warning(f"⚠️ {message}")
 
             if rules["allowances"]:
                 st.markdown("###### Indemnités (Allowances)")
                 for allowance in rules["allowances"]:
-                    amount, currency = allowance.get('thresholds', [{}])[0].get('amount', 'N/A'), allowance.get('currencyCode', '')
-                    st.success(f"**Forfait** → **{amount} {currency}**")
-            
+                    thresholds = safe_get(allowance, 'thresholds', [{}])[0]
+                    amount, currency = thresholds.get('amount', 'N/A'), allowance.get('currencyCode', '')
+                    st.success(f"✅ **Forfait** → **{amount} {currency}**")
             st.divider()
 
-# --- Point d'entrée principal ---
-def main() -> None:
+# --- POINT D'ENTRÉE PRINCIPAL ---
+def main():
     st.title("📊 Rapports d'analyse Cleemy")
     uploaded_file = st.file_uploader("Déposez votre fichier `Full.json` ici", type="json")
 
     if uploaded_file:
-        try:
-            with st.spinner("⏳ Traitement en cours..."):
-                raw_data = load_data(uploaded_file)
-            st.toast("Fichier chargé avec succès !", icon="✅")
-            
-            if "profiles" not in raw_data or "natures" not in raw_data:
-                st.error("❌ Fichier invalide : clés `profiles` ou `natures` manquantes.")
-                return
+        processed_data = load_and_process_data(uploaded_file)
 
-            tabs = [
-                "📖 Vue d'Ensemble",
-                "👤 Analyse par Profil",
-                "📏 Analyse des Limites",
-                "🧾 Analyse Plan Comptable",
-                "🔬 Analyse par Nature"
+        with st.expander("🔍 Inspecter les données et les erreurs"):
+            if processed_data and "raw_data" in processed_data:
+                # Affiche le JSON seulement s'il y a une erreur pour ne pas surcharger
+                if processed_data.get("error"):
+                    st.json(processed_data["raw_data"], expanded=False)
+            if processed_data and processed_data.get("error"):
+                st.subheader("Trace de l'erreur :")
+                st.code(processed_data["error"], language='text')
+
+        if processed_data and processed_data.get("error") is None:
+            st.toast("Fichier traité avec succès !", icon="✅")
+            
+            tabs_titles = [
+                "📖 Vue d'Ensemble", "👤 Analyse par Profil", "🔬 Analyse par Nature",
+                "📏 Analyse des Limites", "🧾 Analyse Plan Comptable"
             ]
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(tabs)
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(tabs_titles)
 
             with tab1:
-                df_profiles = process_profile_data(raw_data)
-                build_overview_ui(df_profiles)
+                build_overview_ui(processed_data["df_profiles"])
             with tab2:
-                build_profile_analysis_ui(raw_data)
+                build_profile_analysis_ui(processed_data["raw_data"], processed_data["nature_lookup"])
             with tab3:
-                build_limits_analysis_ui(raw_data)
+                build_nature_analysis_ui(processed_data["nature_lookup"], processed_data["nature_to_profiles_map"])
             with tab4:
-                build_accounting_plan_ui(raw_data)
+                build_limits_analysis_ui(processed_data["df_limits"])
             with tab5:
-                build_nature_analysis_ui(raw_data)
-                
-        except Exception as e:
-            st.error(f"Une erreur inattendue est survenue : {e}")
-            st.exception(e)
+                build_accounting_plan_ui(processed_data["raw_data"])
     else:
         st.info("👋 En attente d'un fichier JSON pour commencer l'analyse.")
 
