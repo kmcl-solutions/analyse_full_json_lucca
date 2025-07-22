@@ -5,6 +5,7 @@ import json
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 import io
+from io import BytesIO
 import traceback
 
 # --- CONFIGURATION & CONSTANTES ---
@@ -12,12 +13,11 @@ st.set_page_config(page_title="Rapports Cleemy", layout="wide")
 
 PERIOD_TRANSLATION = {"Day": "par Jour", "None": "par Dépense", "Month": "par Mois", "Year": "par An"}
 
-# --- FONCTIONS DE TRAITEMENT DES DONNÉES (VERSION FINALE ET ROBUSTE) ---
+# --- FONCTIONS DE TRAITEMENT DES DONNÉES ---
 
 def safe_get(data, key, default):
     """Fonction utilitaire pour obtenir une valeur ou un défaut sûr (liste/dict)."""
     val = data.get(key, default)
-    # Gère le cas où la clé existe mais sa valeur est None
     if val is None:
         return default
     return val
@@ -28,7 +28,6 @@ def load_and_process_data(uploaded_file: io.BytesIO) -> dict | None:
     Charge, valide et pré-traite les données JSON de manière très robuste.
     """
     try:
-        # Rembobine le fichier au cas où il a déjà été lu
         uploaded_file.seek(0)
         data = json.load(uploaded_file)
 
@@ -67,7 +66,6 @@ def load_and_process_data(uploaded_file: io.BytesIO) -> dict | None:
         return {"error": tb_str, "raw_data": raw_display_data}
 
 def _create_profile_nature_df(data: dict, nature_lookup: dict) -> pd.DataFrame:
-    """Crée le DataFrame des associations Profils/Natures de manière sécurisée."""
     export_data = []
     for profile in safe_get(data, 'profiles', []):
         if not isinstance(profile, dict): continue
@@ -81,7 +79,6 @@ def _create_profile_nature_df(data: dict, nature_lookup: dict) -> pd.DataFrame:
     return pd.DataFrame(export_data)
 
 def _create_limits_df(data: dict, nature_lookup: dict) -> pd.DataFrame:
-    """Crée un DataFrame unifié des limites et indemnités de manière sécurisée."""
     limits_data = []
     for profile in safe_get(data, 'profiles', []):
         if not isinstance(profile, dict): continue
@@ -114,9 +111,6 @@ def _create_limits_df(data: dict, nature_lookup: dict) -> pd.DataFrame:
     return pd.DataFrame(limits_data)
 
 def _create_nature_to_profiles_map(data: dict) -> dict:
-    """
-    Crée un dictionnaire inversé. Version compatible avec le cache de Streamlit.
-    """
     nature_map = {}
     profiles_list = safe_get(data, 'profiles', [])
     if not isinstance(profiles_list, list):
@@ -142,6 +136,7 @@ def _create_nature_to_profiles_map(data: dict) -> dict:
                 profile_rules["allowances"].append(allowance)
     return nature_map
 
+# --- GÉNÉRATION DU RAPPORT PDF ---
 def create_pdf_report(df: pd.DataFrame) -> bytes:
     """
     Génère un rapport PDF avec la syntaxe moderne de fpdf2, sans avertissements.
@@ -149,10 +144,7 @@ def create_pdf_report(df: pd.DataFrame) -> bytes:
     pdf = FPDF()
     pdf.add_page()
 
-    # Utilise la police standard "Helvetica"
     pdf.set_font("Helvetica", 'B', size=12)
-    
-    # Utilise la nouvelle syntaxe pour le saut de ligne
     pdf.cell(
         0, 10, "Rapport d'analyse Cleemy",
         new_x=XPos.LMARGIN, new_y=YPos.NEXT,
@@ -160,18 +152,15 @@ def create_pdf_report(df: pd.DataFrame) -> bytes:
     )
     pdf.ln(10)
 
-    # Préparation du tableau
     num_columns = len(df.columns) if len(df.columns) > 0 else 1
     col_width = 190 / num_columns
 
-    # En-tête du tableau
     pdf.set_font("Helvetica", 'B', size=8)
     for header in df.columns:
         safe_header = str(header).encode('latin-1', 'replace').decode('latin-1')
         pdf.cell(col_width, 10, safe_header, border=1, align='C')
     pdf.ln()
 
-    # Corps du tableau
     pdf.set_font("Helvetica", '', size=8)
     for _, row in df.iterrows():
         for col in df.columns:
@@ -179,17 +168,30 @@ def create_pdf_report(df: pd.DataFrame) -> bytes:
             pdf.cell(col_width, 10, safe_text, border=1)
         pdf.ln()
             
-    # Nouvelle syntaxe pour la sortie en bytes, sans le paramètre "dest"
     return bytes(pdf.output())
 
 # --- INTERFACES DES ONGLETS ---
 def build_overview_ui(df_profiles: pd.DataFrame):
+    """Affiche l'onglet Vue d'ensemble avec exports CSV, PDF, et Excel."""
     st.header("📖 Vue d'ensemble des associations Profils/Natures")
     st.write("Utilisez ce tableau pour une vue globale, filtrer ou exporter les données.")
 
     profils_uniques = sorted(df_profiles["Profil"].unique().tolist())
     options = ["Tous"] + profils_uniques
-    selected_profil = st.selectbox("🔍 Filtrer par profil", options=options, key="overview_select")
+
+    if "overview_select" not in st.session_state:
+        st.session_state.overview_select = "Tous"
+
+    selected_profil = st.selectbox(
+        "🔍 Filtrer par profil",
+        options=options,
+        key="overview_select"
+    )
+
+    col_reset, _ = st.columns([1, 5])
+    if col_reset.button("🔄 Réinitialiser le filtre"):
+        st.session_state.overview_select = "Tous"
+        st.rerun() # Utilise st.rerun() qui est la syntaxe moderne
 
     display_df = df_profiles if selected_profil == "Tous" else df_profiles[df_profiles["Profil"] == selected_profil]
 
@@ -199,13 +201,32 @@ def build_overview_ui(df_profiles: pd.DataFrame):
         st.dataframe(display_df, use_container_width=True)
         st.divider()
         st.subheader("🚀 Exports")
-        col1, col2 = st.columns(2)
-        with col1:
+        col1, col2, col3 = st.columns(3)
+        
+        with col1: # Export CSV
             csv_data = display_df.to_csv(index=False).encode('utf-8')
-            st.download_button(label="📥 Télécharger en CSV", data=csv_data, file_name='rapport_profils.csv', mime='text/csv', use_container_width=True)
-        with col2:
+            st.download_button(
+                label="📥 Télécharger en CSV", data=csv_data,
+                file_name='rapport_profils.csv', mime='text/csv', use_container_width=True
+            )
+        
+        with col2: # Export PDF
             pdf_bytes = create_pdf_report(display_df)
-            st.download_button(label="📄 Télécharger en PDF", data=pdf_bytes, file_name="rapport_profils.pdf", mime="application/pdf", use_container_width=True)
+            st.download_button(
+                label="📄 Télécharger en PDF", data=pdf_bytes,
+                file_name="rapport_profils.pdf", mime="application/pdf", use_container_width=True
+            )
+        
+        with col3: # Export Excel (XLSX)
+            xlsx_output = BytesIO()
+            with pd.ExcelWriter(xlsx_output, engine='openpyxl') as writer:
+                display_df.to_excel(writer, index=False, sheet_name='Rapport')
+            st.download_button(
+                label="📊 Télécharger en Excel", data=xlsx_output.getvalue(),
+                file_name="rapport_profils.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
 
 def build_profile_analysis_ui(data: dict, nature_lookup: dict):
     st.header("👤 Analyse détaillée par Profil")
@@ -268,7 +289,6 @@ def build_accounting_plan_ui(data: dict):
     st.header("🧾 Analyse du Plan Comptable par Nature")
     st.write("Choisissez une nature pour voir son imputation comptable dans chaque plan.")
 
-    # --- Boucle corrigée pour être robuste ---
     costs_accounts_lookup = {}
     for chart in safe_get(data, 'chartsOfAccounts', []):
         if not isinstance(chart, dict): continue
@@ -369,7 +389,6 @@ def main():
 
         with st.expander("🔍 Inspecter les données et les erreurs"):
             if processed_data and "raw_data" in processed_data:
-                # Affiche le JSON seulement s'il y a une erreur pour ne pas surcharger
                 if processed_data.get("error"):
                     st.json(processed_data["raw_data"], expanded=False)
             if processed_data and processed_data.get("error"):
