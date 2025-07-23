@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional
 
 # --- CONFIGURATION & CONSTANTES ---
-st.set_page_config(page_title="Rapports Cleemy", layout="wide")
+st.set_page_config(page_title="Rapports NDF", layout="wide")
 
 PERIOD_TRANSLATION = {"Day": "par Jour", "None": "par Dépense", "Month": "par Mois", "Year": "par An"}
 
@@ -118,7 +118,7 @@ def load_and_process_data(uploaded_file: io.BytesIO) -> dict | None:
         try:
             uploaded_file.seek(0)
             raw_data = json.load(uploaded_file)
-            data = CleemyData.parse_obj(raw_data)
+            data = CleemyData.model_validate(raw_data) # MODIFIÉ
 
             nature_lookup = {n.id: n.name_fr for n in data.natures}
             df_profiles = _create_profile_nature_df(data, nature_lookup)
@@ -139,6 +139,7 @@ def load_and_process_data(uploaded_file: io.BytesIO) -> dict | None:
             return {"error": str(e)}
         except Exception as e:
             st.error(f"Une erreur critique est survenue : {e}")
+            st.code(traceback.format_exc())
             return {"error": traceback.format_exc()}
 
 def _create_profile_nature_df(data: CleemyData, nature_lookup: dict) -> pd.DataFrame:
@@ -201,42 +202,106 @@ def find_orphan_nature_ids(df_profiles, nature_lookup):
     orphans = nature_ids_in_df - nature_ids_in_dict
     return orphans
 
+def audit_inconsistent_rules(data: CleemyData, nature_lookup: dict) -> list:
+    """Trouve les règles avec des montants nuls ou non définis."""
+    warnings = []
+    for profile in data.profiles:
+        for limit in profile.limits:
+            threshold = limit.thresholds[0] if limit.thresholds else Threshold()
+            if threshold.amount is None or threshold.amount == 0:
+                nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in limit.idNatures]
+                warnings.append(
+                    f"**Profil '{profile.name_fr}'** : Limite avec montant nul ou non défini pour : *{', '.join(nature_names)}*."
+                )
+        for allowance in profile.allowances:
+            threshold = allowance.thresholds[0] if allowance.thresholds else Threshold()
+            if threshold.amount is None or threshold.amount == 0:
+                nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in allowance.idNatures]
+                warnings.append(
+                    f"**Profil '{profile.name_fr}'** : Indemnité avec montant nul ou non défini pour : *{', '.join(nature_names)}*."
+                )
+    return warnings
+
 # --- GÉNÉRATION DU RAPPORT PDF ---
-def create_pdf_report(df: pd.DataFrame) -> bytes:
-    """Génère un rapport PDF, en mode paysage si le tableau est trop large."""
-    num_columns = len(df.columns)
-    orientation = 'L' if num_columns > 7 else 'P'
+def _safe_encode(text: str) -> str:
+    """Encode text safely for FPDF's latin-1 font."""
+    return str(text).encode('latin-1', 'replace').decode('latin-1')
+
+class PDF(FPDF):
+    def header(self):
+        self.set_font("Helvetica", "B", 12)
+        self.cell(0, 10, "Rapport d'analyse de configuration Lucca NDF", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C") # MODIFIÉ
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Helvetica", "I", 8)
+        self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", new_x=XPos.RIGHT, new_y=YPos.TOP, align="C") # MODIFIÉ
+
+    def chapter_title(self, title):
+        self.set_font("Helvetica", "B", 12)
+        self.cell(0, 10, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L") # MODIFIÉ
+        self.ln(5)
+
+    def chapter_body(self, df):
+        if df.empty:
+            self.set_font("Helvetica", "", 10)
+            self.multi_cell(0, 10, "Aucune donnée à afficher pour cette section.")
+            self.ln()
+            return
+
+        num_columns = len(df.columns)
+        orientation = 'L' if num_columns > 6 else 'P'
+        if self.cur_orientation != orientation:
+            self.add_page(orientation=orientation)
+
+        effective_page_width = self.w - 2 * self.l_margin
+        col_width = effective_page_width / num_columns
+
+        self.set_font("Helvetica", "B", 8)
+        for header in df.columns:
+            self.cell(col_width, 10, _safe_encode(header), border=1, align="C")
+        self.ln()
+
+        self.set_font("Helvetica", "", 8)
+        for _, row in df.iterrows():
+            for col in df.columns:
+                self.cell(col_width, 10, _safe_encode(row[col]), border=1)
+            self.ln()
+        self.ln(10)
+
+def create_pdf_report(processed_data: dict) -> bytes:
+    """Génère un rapport PDF complet avec une section pour chaque onglet."""
+    pdf = PDF()
+    pdf.alias_nb_pages()
     
-    pdf = FPDF(orientation=orientation)
     pdf.add_page()
-    pdf.set_font("Helvetica", 'B', size=12)
-    pdf.cell(0, 10, "Rapport d'analyse Cleemy", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
-    pdf.ln(10)
-    
-    effective_page_width = pdf.w - 2 * pdf.l_margin
-    col_width = effective_page_width / num_columns if num_columns > 0 else effective_page_width
+    pdf.chapter_title("Vue d'ensemble des associations Profils/Natures")
+    pdf.chapter_body(processed_data["df_profiles"])
 
-    pdf.set_font("Helvetica", 'B', size=8)
-    for header in df.columns:
-        safe_header = str(header).encode('latin-1', 'replace').decode('latin-1')
-        pdf.cell(col_width, 10, safe_header, border=1, align='C')
-    pdf.ln()
+    pdf.add_page()
+    pdf.chapter_title("Analyse comparative des Limites et Indemnites")
+    pdf.chapter_body(processed_data["df_limits"])
 
-    pdf.set_font("Helvetica", '', size=8)
-    for _, row in df.iterrows():
-        for col in df.columns:
-            safe_text = str(row[col]).encode('latin-1', 'replace').decode('latin-1')
-            pdf.cell(col_width, 10, safe_text, border=1)
+    orphans = find_orphan_nature_ids(processed_data["df_profiles"], processed_data["nature_lookup"])
+    if orphans:
+        pdf.add_page()
+        pdf.chapter_title("Incoherences detectees (natures non trouvees)")
+        pdf.set_font("Helvetica", "", 10)
+        orphan_text = f"Les ID de natures suivants sont utilises dans des profils mais ne sont pas definis : {sorted(list(orphans))}"
+        pdf.multi_cell(0, 10, _safe_encode(orphan_text))
         pdf.ln()
-        
+
     return bytes(pdf.output())
 
 
 # --- INTERFACES DES ONGLETS ---
-def build_overview_ui(df_profiles: pd.DataFrame):
-    """Affiche l'onglet Vue d'ensemble avec recherche multi-mots-clés."""
+def build_overview_ui(processed_data: dict):
+    """Affiche l'onglet Vue d'ensemble et gère les exports."""
     st.header("📖 Vue d'ensemble des associations Profils/Natures")
     st.write("Utilisez la barre de recherche pour filtrer sur plusieurs mots-clés (ex: `salarié restaurant`).")
+    
+    df_profiles = processed_data["df_profiles"]
     search_term = st.text_input("🔍 Rechercher sur tout le tableau")
     
     display_df = df_profiles
@@ -255,19 +320,27 @@ def build_overview_ui(df_profiles: pd.DataFrame):
         st.dataframe(display_df, use_container_width=True)
         st.divider()
         st.subheader("🚀 Exports")
-        st.write("Les boutons ci-dessous exporteront les données actuellement affichées (filtrées ou non).")
+        st.write("Les boutons ci-dessous exporteront les données (le CSV est filtré, le PDF et l'Excel sont complets).")
+        
         col1, col2, col3 = st.columns(3)
         with col1:
             csv_data = display_df.to_csv(index=False).encode('utf-8')
             st.download_button(label="📥 Télécharger en CSV", data=csv_data, file_name='rapport_profils.csv', mime='text/csv', use_container_width=True)
         with col2:
-            pdf_bytes = create_pdf_report(display_df)
-            st.download_button(label="📄 Télécharger en PDF", data=pdf_bytes, file_name="rapport_profils.pdf", mime="application/pdf", use_container_width=True)
+            pdf_bytes = create_pdf_report(processed_data)
+            st.download_button(label="📄 Télécharger en PDF", data=pdf_bytes, file_name="rapport_complet.pdf", mime="application/pdf", use_container_width=True)
         with col3:
             xlsx_output = BytesIO()
             with pd.ExcelWriter(xlsx_output, engine='openpyxl') as writer:
-                display_df.to_excel(writer, index=False, sheet_name='Rapport')
-            st.download_button(label="📊 Télécharger en Excel", data=xlsx_output.getvalue(), file_name="rapport_profils.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+                display_df.to_excel(writer, index=False, sheet_name="Vue d'ensemble (filtree)")
+                processed_data['df_limits'].to_excel(writer, index=False, sheet_name="Toutes les regles")
+            st.download_button(
+                label="📊 Télécharger en Excel (multi-feuilles)", 
+                data=xlsx_output.getvalue(), 
+                file_name="rapport_complet.xlsx", 
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
+                use_container_width=True
+            )
 
 def build_profile_analysis_ui(data: CleemyData, nature_lookup: dict):
     st.header("👤 Analyse détaillée par Profil")
@@ -380,6 +453,7 @@ def build_nature_analysis_ui(nature_lookup: dict, nature_to_profiles_map: dict):
     st.divider()
 
     if not selected_nature_id: return
+    
     profiles_for_nature = nature_to_profiles_map.get(selected_nature_id, {})
     if not profiles_for_nature:
         st.warning("Aucun profil n'utilise cette nature.")
@@ -391,6 +465,7 @@ def build_nature_analysis_ui(nature_lookup: dict, nature_to_profiles_map: dict):
             st.markdown(f"#### Profil : {profile_name}")
             if not rules["limits"] and not rules["allowances"]:
                 st.info("Ce profil utilise cette nature sans limite ni indemnité spécifique.")
+            
             if rules["limits"]:
                 st.markdown("###### Limites (Plafonds)")
                 for limit in rules["limits"]:
@@ -398,7 +473,12 @@ def build_nature_analysis_ui(nature_lookup: dict, nature_to_profiles_map: dict):
                     amount, currency = thresholds.amount, limit.currencyCode
                     limit_type, period = getattr(limit, 'type', 'N/A').capitalize(), limit.period
                     message = f"**{limit_type}** → **{amount} {currency or ''}** {PERIOD_TRANSLATION.get(period, period)}"
-                    st.error(f"🛑 {message}") if limit_type == "Absolute" else st.warning(f"⚠️ {message}")
+                    
+                    if limit_type == "Absolute":
+                        st.error(f"🛑 {message}")
+                    else:
+                        st.warning(f"⚠️ {message}")
+            
             if rules["allowances"]:
                 st.markdown("###### Indemnités (Forfaits)")
                 for allowance in rules["allowances"]:
@@ -433,11 +513,13 @@ def build_comparison_ui(df_profiles: pd.DataFrame, df_limits: pd.DataFrame):
 
 # --- POINT D'ENTRÉE PRINCIPAL ---
 def main():
-    st.title("📊 Rapports d'analyse JSON - Lucca Notes de Frais (anciennement Cleemy)")
+    st.title("📊 Analyseur de configuration Lucca NDF")
+    
     st.info(
         "👋 **Bienvenue !** Cet outil vous permet d'analyser et d'auditer vos profils de dépenses."
         " Chargez votre fichier `Full.json` ci-dessous pour commencer."
     )
+
     uploaded_file = st.file_uploader("Déposez votre fichier `Full.json` ici", type="json")
 
     if uploaded_file:
@@ -446,11 +528,16 @@ def main():
         if processed_data and processed_data.get("error") is None:
             st.toast("Fichier validé et traité avec succès !", icon="✅")
             
-            # Audit des natures orphelines
             orphans = find_orphan_nature_ids(processed_data["df_profiles"], processed_data["nature_lookup"])
             if orphans:
                 with st.expander("🚩 Incohérences détectées (natures non trouvées)", expanded=False):
                     st.warning(f"Les ID suivants sont présents dans des profils mais absents de la table des natures : {sorted(list(orphans))}")
+
+            inconsistencies = audit_inconsistent_rules(processed_data["pydantic_data"], processed_data["nature_lookup"])
+            if inconsistencies:
+                with st.expander("⚠️ Alertes de configuration (règles à 0 ou sans montant)", expanded=True):
+                    for warning_text in inconsistencies:
+                        st.warning(warning_text)
 
             tabs_titles = [
                 "📖 Vue d'Ensemble", "👤 Analyse par Profil", "🔬 Analyse par Nature",
@@ -459,7 +546,7 @@ def main():
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tabs_titles)
 
             with tab1:
-                build_overview_ui(processed_data["df_profiles"])
+                build_overview_ui(processed_data)
             with tab2:
                 build_profile_analysis_ui(processed_data["pydantic_data"], processed_data["nature_lookup"])
             with tab3:
