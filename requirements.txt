@@ -1,3 +1,5 @@
 streamlit
 pandas
-fpdf==2.7.8
+pydantic
+fpdf2
+openpyxl
