@@ -9,13 +9,14 @@ from io import BytesIO
 import traceback
 from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional
+from enum import Enum
 
 # --- CONFIGURATION & CONSTANTES ---
 st.set_page_config(page_title="Rapports NDF", layout="wide")
 
 PERIOD_TRANSLATION = {"Day": "par Jour", "None": "par Dépense", "Month": "par Mois", "Year": "par An"}
 
-class JsonKeys:
+class JsonKeys(str, Enum):
     PROFILES = "profiles"
     NATURES = "natures"
     LIMITS = "limits"
@@ -118,7 +119,7 @@ def load_and_process_data(uploaded_file: io.BytesIO) -> dict | None:
         try:
             uploaded_file.seek(0)
             raw_data = json.load(uploaded_file)
-            data = CleemyData.model_validate(raw_data) # MODIFIÉ
+            data = CleemyData.model_validate(raw_data)
 
             nature_lookup = {n.id: n.name_fr for n in data.natures}
             df_profiles = _create_profile_nature_df(data, nature_lookup)
@@ -222,6 +223,43 @@ def audit_inconsistent_rules(data: CleemyData, nature_lookup: dict) -> list:
                 )
     return warnings
 
+# --- FONCTION D'ASSISTANCE POUR L'AFFICHAGE ---
+def display_rule(rule, nature_lookup: dict, show_natures: bool = True):
+    """
+    Affiche une règle (Limite ou Indemnité) de manière formatée dans Streamlit.
+    """
+    # Cas 1 : La règle est une Limite
+    if isinstance(rule, Limit):
+        thresholds = rule.thresholds[0] if rule.thresholds else Threshold()
+        amount = thresholds.amount
+        currency = rule.currencyCode
+        limit_type = getattr(rule, 'type', 'N/A').capitalize()
+        period = PERIOD_TRANSLATION.get(rule.period, rule.period)
+
+        if limit_type == "Absolute":
+            icon, color_func = "🛑", st.error
+        else:
+            icon, color_func = "⚠️", st.warning
+        
+        message = f"{icon} **{limit_type}** → **{amount or 'N/A'} {currency or ''}** {period}"
+        if show_natures:
+            nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in rule.idNatures]
+            message += f" pour : **{', '.join(nature_names)}**"
+        color_func(message)
+
+    # Cas 2 : La règle est une Indemnité (Allowance)
+    elif isinstance(rule, Allowance):
+        thresholds = rule.thresholds[0] if rule.thresholds else Threshold()
+        amount = thresholds.amount
+        currency = rule.currencyCode
+        
+        message = f"✅ **Forfait** → **{amount or 'N/A'} {currency or ''}**"
+        if show_natures:
+            nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in rule.idNatures]
+            message += f" pour : **{', '.join(nature_names)}**"
+        st.success(message)
+
+
 # --- GÉNÉRATION DU RAPPORT PDF ---
 def _safe_encode(text: str) -> str:
     """Encode text safely for FPDF's latin-1 font."""
@@ -230,17 +268,17 @@ def _safe_encode(text: str) -> str:
 class PDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 12)
-        self.cell(0, 10, "Rapport d'analyse de configuration Lucca NDF", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C") # MODIFIÉ
+        self.cell(0, 10, "Rapport d'analyse de configuration Lucca NDF", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
         self.ln(5)
 
     def footer(self):
         self.set_y(-15)
         self.set_font("Helvetica", "I", 8)
-        self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", new_x=XPos.RIGHT, new_y=YPos.TOP, align="C") # MODIFIÉ
+        self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", new_x=XPos.RIGHT, new_y=YPos.TOP, align="C")
 
     def chapter_title(self, title):
         self.set_font("Helvetica", "B", 12)
-        self.cell(0, 10, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L") # MODIFIÉ
+        self.cell(0, 10, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
         self.ln(5)
 
     def chapter_body(self, df):
@@ -365,24 +403,14 @@ def build_profile_analysis_ui(data: CleemyData, nature_lookup: dict):
         st.info("Aucune limite spécifique n'est définie.")
     else:
         for limit in profile.limits:
-            thresholds = limit.thresholds[0] if limit.thresholds else Threshold()
-            amount, currency = thresholds.amount, limit.currencyCode
-            limit_type, period = getattr(limit, 'type', 'N/A').capitalize(), limit.period
-            nature_names_limit = [nature_lookup.get(nid, f"ID {nid}") for nid in limit.idNatures]
-            prefix = "🛑" if limit_type == "Absolute" else "⚠️"
-            message = f"{prefix} **{limit_type}** → **{amount} {currency or ''}** {PERIOD_TRANSLATION.get(period, period)} pour : **{', '.join(filter(None, nature_names_limit))}**"
-            st.markdown(message)
+            display_rule(limit, nature_lookup)
 
     st.markdown("##### Indemnités Forfaitaires (Allowances)")
     if not profile.allowances:
         st.info("Aucune indemnité forfaitaire n'est définie.")
     else:
         for allowance in profile.allowances:
-            thresholds = allowance.thresholds[0] if allowance.thresholds else Threshold()
-            amount, currency = thresholds.amount, allowance.currencyCode
-            nature_names_allowance = [nature_lookup.get(nid, f"ID {nid}") for nid in allowance.idNatures]
-            message = f"✅ **Forfait** → **{amount} {currency or ''}** pour : **{', '.join(filter(None, nature_names_allowance))}**"
-            st.markdown(message)
+            display_rule(allowance, nature_lookup)
 
 def build_limits_analysis_ui(df_limits: pd.DataFrame):
     st.header("📏 Analyse comparative des Limites et Indemnités")
@@ -469,22 +497,12 @@ def build_nature_analysis_ui(nature_lookup: dict, nature_to_profiles_map: dict):
             if rules["limits"]:
                 st.markdown("###### Limites (Plafonds)")
                 for limit in rules["limits"]:
-                    thresholds = limit.thresholds[0] if limit.thresholds else Threshold()
-                    amount, currency = thresholds.amount, limit.currencyCode
-                    limit_type, period = getattr(limit, 'type', 'N/A').capitalize(), limit.period
-                    message = f"**{limit_type}** → **{amount} {currency or ''}** {PERIOD_TRANSLATION.get(period, period)}"
-                    
-                    if limit_type == "Absolute":
-                        st.error(f"🛑 {message}")
-                    else:
-                        st.warning(f"⚠️ {message}")
+                    display_rule(limit, nature_lookup, show_natures=False)
             
             if rules["allowances"]:
                 st.markdown("###### Indemnités (Forfaits)")
                 for allowance in rules["allowances"]:
-                    thresholds = allowance.thresholds[0] if allowance.thresholds else Threshold()
-                    amount, currency = thresholds.amount, allowance.currencyCode
-                    st.success(f"✅ **Forfait** → **{amount} {currency or ''}**")
+                    display_rule(allowance, nature_lookup, show_natures=False)
 
 def build_comparison_ui(df_profiles: pd.DataFrame, df_limits: pd.DataFrame):
     st.header("⚖️ Comparateur de Profils")
