@@ -13,7 +13,7 @@ st.set_page_config(page_title="Rapports Cleemy", layout="wide")
 
 PERIOD_TRANSLATION = {"Day": "par Jour", "None": "par Dépense", "Month": "par Mois", "Year": "par An"}
 
-# --- FONCTIONS DE TRAITEMENT DES DONNÉES ---
+# --- FONCTIONS DE TRAITEMENT DES DONNÉES (inchangées) ---
 
 def safe_get(data, key, default):
     """Fonction utilitaire pour obtenir une valeur ou un défaut sûr (liste/dict)."""
@@ -24,9 +24,7 @@ def safe_get(data, key, default):
 
 @st.cache_data
 def load_and_process_data(uploaded_file: io.BytesIO) -> dict | None:
-    """
-    Charge, valide et pré-traite les données JSON de manière très robuste.
-    """
+    """Charge, valide et pré-traite les données JSON de manière très robuste."""
     try:
         uploaded_file.seek(0)
         data = json.load(uploaded_file)
@@ -136,71 +134,53 @@ def _create_nature_to_profiles_map(data: dict) -> dict:
                 profile_rules["allowances"].append(allowance)
     return nature_map
 
-# --- GÉNÉRATION DU RAPPORT PDF ---
+# --- GÉNÉRATION DU RAPPORT PDF (inchangée) ---
 def create_pdf_report(df: pd.DataFrame) -> bytes:
-    """
-    Génère un rapport PDF avec la syntaxe moderne de fpdf2, sans avertissements.
-    """
+    """Génère un rapport PDF avec la syntaxe moderne de fpdf2, sans avertissements."""
     pdf = FPDF()
     pdf.add_page()
-
     pdf.set_font("Helvetica", 'B', size=12)
-    pdf.cell(
-        0, 10, "Rapport d'analyse Cleemy",
-        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
-        align='C'
-    )
+    pdf.cell(0, 10, "Rapport d'analyse Cleemy", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
     pdf.ln(10)
-
     num_columns = len(df.columns) if len(df.columns) > 0 else 1
     col_width = 190 / num_columns
-
     pdf.set_font("Helvetica", 'B', size=8)
     for header in df.columns:
         safe_header = str(header).encode('latin-1', 'replace').decode('latin-1')
         pdf.cell(col_width, 10, safe_header, border=1, align='C')
     pdf.ln()
-
     pdf.set_font("Helvetica", '', size=8)
     for _, row in df.iterrows():
         for col in df.columns:
             safe_text = str(row[col]).encode('latin-1', 'replace').decode('latin-1')
             pdf.cell(col_width, 10, safe_text, border=1)
         pdf.ln()
-            
     return bytes(pdf.output())
 
-# --- INTERFACES DES ONGLETS ---
+# --- INTERFACES DES ONGLETS (MODIFIÉES) ---
+
 def build_overview_ui(df_profiles: pd.DataFrame):
-    """Affiche l'onglet Vue d'ensemble avec exports CSV, PDF, et Excel."""
+    """Affiche l'onglet Vue d'ensemble avec exports et barre de recherche."""
     st.header("📖 Vue d'ensemble des associations Profils/Natures")
-    st.write("Utilisez ce tableau pour une vue globale, filtrer ou exporter les données.")
+    
+    ### AMÉLIORATION UX : Remplacement du selectbox par une barre de recherche textuelle ###
+    st.write("Utilisez la barre de recherche pour filtrer dynamiquement les profils.")
+    search_term = st.text_input("🔍 Rechercher un profil par son nom")
 
-    profils_uniques = sorted(df_profiles["Profil"].unique().tolist())
-    options = ["Tous"] + profils_uniques
-
-    if "overview_select" not in st.session_state:
-        st.session_state.overview_select = "Tous"
-
-    selected_profil = st.selectbox(
-        "🔍 Filtrer par profil",
-        options=options,
-        key="overview_select"
-    )
-
-    col_reset, _ = st.columns([1, 5])
-    if col_reset.button("🔄 Réinitialiser le filtre"):
-        st.session_state.overview_select = "Tous"
-        st.rerun() # Utilise st.rerun() qui est la syntaxe moderne
-
-    display_df = df_profiles if selected_profil == "Tous" else df_profiles[df_profiles["Profil"] == selected_profil]
+    if search_term:
+        # Filtre le dataframe si un terme de recherche est entré
+        display_df = df_profiles[df_profiles["Profil"].str.contains(search_term, case=False, na=False)]
+    else:
+        # Affiche tout le dataframe par défaut
+        display_df = df_profiles
 
     if display_df.empty:
-        st.warning("Aucun résultat pour ce filtre.")
+        st.warning("Aucun résultat pour cette recherche.")
     else:
         st.dataframe(display_df, use_container_width=True)
         st.divider()
         st.subheader("🚀 Exports")
+        st.write("Les boutons ci-dessous exporteront les données actuellement affichées (filtrées ou non).")
         col1, col2, col3 = st.columns(3)
         
         with col1: # Export CSV
@@ -228,25 +208,76 @@ def build_overview_ui(df_profiles: pd.DataFrame):
                 use_container_width=True
             )
 
+def build_limits_analysis_ui(df_limits: pd.DataFrame):
+    """Affiche l'onglet d'analyse des limites avec une visualisation graphique."""
+    st.header("📏 Analyse comparative des Limites et Indemnités")
+    
+    if df_limits.empty:
+        st.warning("Aucune limite ou indemnité n'a été trouvée dans le fichier.")
+    else:
+        ### AMÉLIORATION UX : Ajout d'une visualisation graphique ###
+        st.subheader("Visualisation du nombre de règles par profil")
+        st.write("Ce graphique montre combien de règles (limites + indemnités) sont définies pour chaque profil.")
+        rules_per_profile = df_limits["Profil"].value_counts()
+        st.bar_chart(rules_per_profile)
+        
+        st.divider()
+        st.subheader("Tableau détaillé des règles")
+        st.write("Ce tableau centralise toutes les règles de tous les profils pour faciliter leur comparaison.")
+        st.dataframe(df_limits, use_container_width=True)
+
+### AMÉLIORATION UX : NOUVELLE FONCTION POUR LE COMPARATEUR DE PROFILS ###
+def build_comparison_ui(df_profiles: pd.DataFrame, df_limits: pd.DataFrame):
+    """Affiche un outil pour comparer plusieurs profils côte à côte."""
+    st.header("⚖️ Comparateur de Profils")
+    st.write("Sélectionnez deux profils ou plus pour afficher leurs configurations côte à côte.")
+
+    all_profiles = sorted(df_profiles["Profil"].unique())
+    
+    selected_profiles = st.multiselect(
+        "Choisissez les profils à comparer",
+        options=all_profiles
+    )
+
+    if len(selected_profiles) > 1:
+        st.divider()
+        # Crée autant de colonnes qu'il y a de profils sélectionnés
+        cols = st.columns(len(selected_profiles))
+        
+        for i, profile_name in enumerate(selected_profiles):
+            with cols[i]:
+                st.subheader(profile_name)
+
+                # Affiche les natures associées pour ce profil
+                st.markdown("**Natures associées :**")
+                natures_for_profile = df_profiles[df_profiles["Profil"] == profile_name]["Nom de la nature"]
+                st.dataframe(natures_for_profile, hide_index=True, use_container_width=True)
+                
+                # Affiche les règles (limites et indemnités) pour ce profil
+                st.markdown("**Règles définies :**")
+                rules_for_profile = df_limits[df_limits["Profil"] == profile_name]
+                if rules_for_profile.empty:
+                    st.info("Aucune règle spécifique.")
+                else:
+                    st.dataframe(rules_for_profile.drop(columns=['Profil']), hide_index=True, use_container_width=True)
+    elif len(selected_profiles) == 1:
+        st.info("Veuillez sélectionner au moins deux profils pour les comparer.")
+
+# Les autres fonctions d'UI (build_profile_analysis_ui, etc.) restent inchangées...
 def build_profile_analysis_ui(data: dict, nature_lookup: dict):
     st.header("👤 Analyse détaillée par Profil")
     st.write("Choisissez un profil pour afficher en détail sa configuration complète.")
-
     profiles = {p.get('multilingualName', {}).get('fr-FR', f"ID {p.get('id', 'N/A')}"): p for p in safe_get(data, 'profiles', []) if isinstance(p, dict)}
     sorted_profiles = sorted(profiles.keys())
     selected_profil_name = st.selectbox("Sélectionnez un profil", options=sorted_profiles, key="profile_select")
-
     if not selected_profil_name: return
-
     profile = profiles[selected_profil_name]
     st.divider()
     st.subheader(f"Détails pour : {selected_profil_name}")
-
     st.markdown("##### Natures associées")
     id_natures = safe_get(profile, 'idNatures', [])
     nature_names = [nature_lookup.get(nid, f"ID {nid}") for nid in id_natures]
     st.dataframe({"Natures": sorted(nature_names)}, use_container_width=True)
-
     st.markdown("##### Limites de Dépenses (Plafonds)")
     limits = safe_get(profile, 'limits', [])
     if not limits:
@@ -262,7 +293,6 @@ def build_profile_analysis_ui(data: dict, nature_lookup: dict):
             message = f"{prefix} **{limit_type}** → **{amount} {currency}** {PERIOD_TRANSLATION.get(period, period)} pour : **{', '.join(filter(None, nature_names_limit))}**"
             limit_messages.append(message)
         st.markdown("\n\n".join(limit_messages))
-
     st.markdown("##### Indemnités Forfaitaires (Allowances)")
     allowances = safe_get(profile, 'allowances', [])
     if not allowances:
@@ -277,41 +307,26 @@ def build_profile_analysis_ui(data: dict, nature_lookup: dict):
             allowance_messages.append(message)
         st.markdown("\n\n".join(allowance_messages))
 
-def build_limits_analysis_ui(df_limits: pd.DataFrame):
-    st.header("📏 Analyse comparative des Limites et Indemnités")
-    st.write("Ce tableau centralise toutes les règles de tous les profils pour faciliter leur comparaison.")
-    if df_limits.empty:
-        st.warning("Aucune limite ou indemnité n'a été trouvée dans le fichier.")
-    else:
-        st.dataframe(df_limits, use_container_width=True)
-
 def build_accounting_plan_ui(data: dict):
     st.header("🧾 Analyse du Plan Comptable par Nature")
     st.write("Choisissez une nature pour voir son imputation comptable dans chaque plan.")
-
     costs_accounts_lookup = {}
     for chart in safe_get(data, 'chartsOfAccounts', []):
         if not isinstance(chart, dict): continue
         chart_id = chart.get('id')
         if chart_id is None: continue
-
         accounts_dict = {}
         for acc in safe_get(chart, 'costsAccounts', []):
             if not isinstance(acc, dict): continue
             acc_id = acc.get('id')
             if acc_id is None: continue
-            
             format_list = safe_get(acc, 'format', [])
             value = format_list[0].get('value', 'N/A') if format_list else 'N/A'
             accounts_dict[acc_id] = value
-            
         costs_accounts_lookup[chart_id] = accounts_dict
-
     natures_list = sorted([(n.get('multilingualName', {}).get('fr-FR', f"ID {n['id']}"), n['id']) for n in safe_get(data, 'natures', []) if isinstance(n, dict)])
-    
     selected_nature_name = st.selectbox("Choisissez une nature à analyser", options=[n[0] for n in natures_list], key="accounting_select")
     st.divider()
-
     if selected_nature_name:
         selected_nature_id = next((n[1] for n in natures_list if n[0] == selected_nature_name), None)
         found = False
@@ -334,31 +349,20 @@ def build_accounting_plan_ui(data: dict):
 def build_nature_analysis_ui(nature_lookup: dict, nature_to_profiles_map: dict):
     st.header("🔬 Analyse détaillée par Nature")
     st.write("Choisissez une nature pour voir tous les profils et les règles qui s'y appliquent.")
-
     natures_list = sorted(nature_lookup.items(), key=lambda item: item[1])
-    selected_nature_id = st.selectbox(
-        "Sélectionnez une nature",
-        options=[n[0] for n in natures_list],
-        format_func=lambda x: nature_lookup.get(x, "N/A"),
-        key="nature_select"
-    )
+    selected_nature_id = st.selectbox("Sélectionnez une nature", options=[n[0] for n in natures_list], format_func=lambda x: nature_lookup.get(x, "N/A"), key="nature_select")
     st.divider()
-
     if not selected_nature_id: return
-
     profiles_for_nature = nature_to_profiles_map.get(selected_nature_id, {})
     if not profiles_for_nature:
         st.warning("Aucun profil n'utilise cette nature.")
         return
-
     st.subheader(f"Profils et règles pour : {nature_lookup[selected_nature_id]}")
     for profile_name, rules in sorted(profiles_for_nature.items()):
         with st.container():
             st.markdown(f"#### Profil : {profile_name}")
-
             if not rules["limits"] and not rules["allowances"]:
                 st.info("Ce profil utilise cette nature sans limite ni indemnité spécifique.")
-
             if rules["limits"]:
                 st.markdown("###### Limites (Plafonds)")
                 for limit in rules["limits"]:
@@ -370,7 +374,6 @@ def build_nature_analysis_ui(nature_lookup: dict, nature_to_profiles_map: dict):
                         st.error(f"🛑 {message}")
                     else:
                         st.warning(f"⚠️ {message}")
-
             if rules["allowances"]:
                 st.markdown("###### Indemnités (Allowances)")
                 for allowance in rules["allowances"]:
@@ -379,7 +382,7 @@ def build_nature_analysis_ui(nature_lookup: dict, nature_to_profiles_map: dict):
                     st.success(f"✅ **Forfait** → **{amount} {currency}**")
             st.divider()
 
-# --- POINT D'ENTRÉE PRINCIPAL ---
+# --- POINT D'ENTRÉE PRINCIPAL (MODIFIÉ) ---
 def main():
     st.title("📊 Rapports d'analyse Cleemy")
     uploaded_file = st.file_uploader("Déposez votre fichier `Full.json` ici", type="json")
@@ -398,11 +401,16 @@ def main():
         if processed_data and processed_data.get("error") is None:
             st.toast("Fichier traité avec succès !", icon="✅")
             
+            ### AMÉLIORATION UX : Ajout de l'onglet comparateur ###
             tabs_titles = [
-                "📖 Vue d'Ensemble", "👤 Analyse par Profil", "🔬 Analyse par Nature",
-                "📏 Analyse des Limites", "🧾 Analyse Plan Comptable"
+                "📖 Vue d'Ensemble",
+                "👤 Analyse par Profil",
+                "🔬 Analyse par Nature",
+                "📏 Analyse des Limites",
+                "🧾 Analyse Plan Comptable",
+                "⚖️ Comparateur de Profils" # Nouvel onglet
             ]
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(tabs_titles)
+            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tabs_titles)
 
             with tab1:
                 build_overview_ui(processed_data["df_profiles"])
@@ -414,6 +422,9 @@ def main():
                 build_limits_analysis_ui(processed_data["df_limits"])
             with tab5:
                 build_accounting_plan_ui(processed_data["raw_data"])
+            with tab6:
+                ### AMÉLIORATION UX : Appel de la nouvelle fonction pour le comparateur ###
+                build_comparison_ui(processed_data["df_profiles"], processed_data["df_limits"])
     else:
         st.info("👋 En attente d'un fichier JSON pour commencer l'analyse.")
 
