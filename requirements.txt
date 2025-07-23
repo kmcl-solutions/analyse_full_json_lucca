@@ -1,0 +1,3 @@
+streamlit
+pandas
+fpdf==2.7.8
