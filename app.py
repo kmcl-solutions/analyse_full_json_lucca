@@ -434,7 +434,10 @@ def build_comparison_ui(df_profiles: pd.DataFrame, df_limits: pd.DataFrame):
 # --- POINT D'ENTRÉE PRINCIPAL ---
 def main():
     st.title("📊 Rapports d'analyse JSON - Lucca Notes de Frais (anciennement Cleemy)")
-    st.info("Version optimisée avec validation Pydantic, cache sécurisé, PDF dynamique et recherche avancée.")
+    st.info(
+        "👋 **Bienvenue !** Cet outil vous permet d'analyser et d'auditer vos profils de dépenses."
+        " Chargez votre fichier `Full.json` ci-dessous pour commencer."
+    )
     uploaded_file = st.file_uploader("Déposez votre fichier `Full.json` ici", type="json")
 
     if uploaded_file:
